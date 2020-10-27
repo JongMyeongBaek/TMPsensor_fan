@@ -1,0 +1,557 @@
+#include <avr/io.h> 
+#include <avr/interrupt.h> 
+#include <util/delay.h> 
+#include "lcd.h"
+
+#define  Avg_Num     40         //  이동 평균 갯수 
+#define  Amp_Gain   11         //  증폭기 이득  
+
+void init_serial(void) ;  //  Serial 통신포트 초기화
+void SerialPutChar(char ch);
+void SerialPutString(char str[]);
+
+
+void HexToDec( unsigned short num, unsigned short radix); 
+
+char NumToAsc( unsigned char Num ); 
+
+static volatile unsigned char cnumber[5] = {0, 0, 0, 0, 0}; 
+	 
+void Display_Number_LCD( unsigned int num, unsigned char digit ) ;    // 부호없는 정수형 변수를 10진수 형태로 LCD 에 디스플레이 
+void Display_TMP_LCD( unsigned int tp  )  ;                           // 온도를 10진수 형태로 LCD 에 디스플레이 
+
+void msec_delay(unsigned int n);
+void usec_delay(unsigned int n);
+
+ 
+void DC_Motor_Run_Fwd( short duty );    // DC 모터 정회전(PWM구동) 함수 
+void DC_Motor_Run_Rev( short duty );    // DC 모터 역회전(PWM구동) 함수  
+void DC_Motor_Stop( void );             // DC 모터 정지 함수  
+ 
+void DC_Motor_PWM( short Vref );        // DC 모터 PWM 신호 발생 함수  
+                                        // 정토크(Vref>0), 역토크(Vref<0), 영토크(Vref=0) 모두 포함 
+
+static volatile short  Vmax = 0 ; 
+
+static volatile unsigned short TMP_sensor_ouput= 0,  TMP_sensor_ouput_avg = 0, TMP_sensor_ouput_avg_C = 0, TMP_sensor_value= 0; 
+
+static volatile char Cmd_Message_1[] = { "TEMP = " } ;     //  Blutooth Command  Slave --> Master
+
+
+static volatile  char  recv_cnt = 0, rdata=0, new_recv_flag = 0, speed = 0, mode_flag = 0  ;  
+
+
+
+int main() 
+{   
+     
+	short duty = 0;       
+
+
+	DDRB |= 0x20;   // 모터구동신호 + 단자:  PWM 포트( pin: OC1A(PB5) )   --> 출력 설정 
+	DDRA |= 0x01;   // 모터구동신호 - 단자 : 범용 입/출력포트(pin : PA0 ) --> 출력 설정 
+
+
+    init_serial() ;    // Serial Port (USART1) 초기화
+
+     LcdInit();         // LCD 초기화 
+
+
+     UCSR1B |=  0x80  ;      // UART1 송신(RX) 완료 인터럽트 허용
+
+	LcdCommand(ALLCLR);
+	LcdMove(0,0);  
+	LcdPuts("TMP =     C");
+ 
+
+// 모터구동신호 ( pin: OC1A(PB5) ),   Timer1, PWM signal (period= 200 usec )
+
+	TCCR1A = 0x82;    // OC1A(PB5)) :  PWM 포트 설정,   Fast PWM ( mode 14 )
+	TCCR1B = 0x1b;    // 64 분주 타이머 1 시작 (내부클럭 주기 =  64/(16*10^6) = 4 usec ),  Fast PWM ( mode 14 ) 
+	ICR1 = 50;        // PWM 주기 = 50 * 4 usec = 200 usec (  PWM 주파수 = 1/200usec = 5 kHz )
+
+    Vmax = ICR1; 
+
+	OCR1A = duty;      //  OC1A(PB5) PWM duty = 0 설정 : 모터 정지
+//////////////////////////////////////////////////////////////////
+
+    duty = 0;      // 모터 속도 설정, 최대 = Vmax = 50,  최소 = 0 
+
+
+/*****   AD Converter **********/
+
+	ADMUX &= ~0xE0;    //  ADC 기준전압 = AREF ,   ADC 결과 오른쪽정렬 
+	ADCSRA |= 0x87;     // ADC enable, Prescaler = 128
+
+/**** Timer0 Overflow Interrupt  ******/
+/**************************************/
+	TCCR0 = 0x00; 
+    TCNT0 = 256 - 156;       //  내부클럭주기 = 1024/ (16x10^6) = 64 usec,  
+                             //  오버플로인터럽트 주기 = 10msec
+                             //  156 = 10msec/ 64use
+
+	TIMSK = 0x01;  // Timer0 overflow interrupt enable 
+	sei();         // Global Interrupt Enable 
+
+
+	TCCR0 |= 0x07; // Clock Prescaler N=1024 (Timer 0 Start)
+ //////////////////////////////
+
+
+	 
+	while (1) 
+	{ 
+
+
+         if( new_recv_flag == 1 )      // 1 문자 수신완료 시 
+		 { 
+
+		  //////////////  명령어 처리   //////////////
+
+			if( rdata == '0' )          // 문자 0 이 수신되면 
+			{
+                mode_flag = 0;           //  자동 모드 설정 
+			}
+			else if( rdata == '1' )     // 문자 1 이 수신되면
+			{
+                mode_flag = 1;          //  수동 모드 설정 
+			}
+			else if( rdata == '2' )     // 문자 2 이 수신되면
+			{
+                speed = 0 ;          //  수동 모드 (정지)
+			}
+			else if( rdata == '3' )     // 문자 3 이 수신되면
+			{
+                speed = 1;          //  수동 모드 (저속)
+			}
+			else if( rdata == '4' )     // 문자 4 이 수신되면
+			{
+                speed = 2;          //  수동 모드 (중속)
+			}
+			else if( rdata == '5' )     // 문자 5 이 수신되면
+			{
+                speed = 3;          //  수동 모드 (고속)
+			}
+
+			else if( rdata == '6')      // 문자 6 가 수신되면
+			{
+
+		        HexToDec(TMP_sensor_value,10);   // 수신된 바이트수 recv_cnt 십진수로 변환
+
+                SerialPutString( "Temperature = " );     //  메시지 전송 
+
+                SerialPutChar( NumToAsc(cnumber[2]));     //  변수 TMP_sensor_value값 전송
+                SerialPutChar( NumToAsc(cnumber[1])); 
+                SerialPutString( "." );                   //  메시지 전송 
+                SerialPutChar( NumToAsc(cnumber[0])); 
+                SerialPutString( "C" );                   //  메시지 전송 
+                SerialPutChar('\n');                    // 휴대폰으로 데이터 전송시 Line Feed('\n')를 항상 끝에 전송해야함
+ 
+			} 
+
+			else if( rdata != 0xFF)    //  명령 오류 이면
+			{
+
+                SerialPutString( "Command Error!!  Try again.\n" ); //  명령 오류 메시지 전송
+
+
+			}
+
+
+		   rdata = 0xFF;                           // 수신된 명령을 초기값으로 리셋
+           new_recv_flag = 0;                      // 새 문자(명령) 수신 플래그 Reset
+  
+
+        }
+
+
+
+
+      ////////////////////////////////////////
+ 
+	    cli();
+
+        TMP_sensor_value = TMP_sensor_ouput_avg_C;
+
+        sei();
+
+
+
+  	    LcdMove(1,0); 
+        Display_Number_LCD( speed, 3 ) ; 
+		LcdPuts(" ");
+        Display_Number_LCD( mode_flag, 3 ) ; 
+
+
+ 	    LcdMove(0,6); 
+        Display_TMP_LCD( TMP_sensor_value ) ; 
+
+
+       if( mode_flag == 0 )   // 자동모드 
+	   { 
+
+        	if ( TMP_sensor_value < 270 )
+			{
+				DC_Motor_Stop();              // DC Motor 정지 2초
+
+        	}
+			else if ( TMP_sensor_value >= 270 && TMP_sensor_value <= 280  )
+			{
+
+	    		duty = 20;
+				DC_Motor_Run_Fwd( duty );     // DC Motor 정회전 5초 (약)
+
+			}
+		
+			else if ( TMP_sensor_value > 280 && TMP_sensor_value <= 300 )
+        	{
+        		duty = 35;
+				DC_Motor_Run_Fwd( duty );     // DC Motor 정회전 5초 (중)
+        	}
+		
+			else if ( TMP_sensor_value > 300 )
+        	{
+				duty = 50;
+				DC_Motor_Run_Fwd( duty );     // DC Motor 정회전 5초 (강)
+ 
+        	}
+
+      }
+
+     else if( mode_flag == 1 )   // 수동모드 
+	 {   
+        	if( speed == 0 ) 
+			{
+				DC_Motor_Stop();              // DC Motor 정지 
+
+        	}
+			else if ( speed == 1 )
+			{
+
+	    		duty = 20;
+				DC_Motor_Run_Fwd( duty );     // DC Motor 정회전 (약)
+
+			}
+		
+			else if (  speed == 2 )
+        	{
+        		duty = 35;
+				DC_Motor_Run_Fwd( duty );     // DC Motor 정회전 (중)
+        	}
+		
+			else if (  speed >= 3 )
+        	{
+				duty = 50;
+				DC_Motor_Run_Fwd( duty );     // DC Motor 정회전 (강)
+ 
+        	}      	
+
+     }
+
+
+
+
+   } //while( ) 끝 
+
+
+}    //  main()  끝 
+
+
+
+
+
+
+// UART1 수신 인터럽트 서비스 프로그램
+
+ISR(  USART1_RX_vect )
+{
+
+    rdata = UDR1; 
+ 
+    SerialPutChar( rdata);           // Echo  수신된 데이터를 바로 송신하여 수신된 데이터가 정확한지 확인 
+    SerialPutChar('\n');             // 휴대폰으로 데이터 전송시 Line Feed('\n')를 항상 끝에 전송해야함
+
+    recv_cnt++ ;                     // 수신된 데이터 바이트수 저장
+
+    new_recv_flag = 1;               // 새 문자(명령) 수신 플래그 Set
+
+}
+
+
+
+// UART1 통신 초기화 프로그램 
+
+void init_serial(void)
+{
+    UCSR1A = 0x00;                    //초기화
+    UCSR1B = 0x18  ;                  //송수신허용,  송수신 인터럽트 금지
+    UCSR1C = 0x06;                    //데이터 전송비트 수 8비트로 설정.
+    
+    UBRR1H = 0x00;
+    UBRR1L = 103;                     //Baud Rate 9600 
+}
+
+
+
+
+//======================================
+// 한 문자를 송신한다.
+//======================================
+
+void SerialPutChar(char ch)
+{
+	while(!(UCSR1A & (1<<UDRE)));			// 버퍼가 빌 때를 기다림
+  	UDR1 = ch;								// 버퍼에 문자를 쓴다
+}
+
+
+//=============================================
+// 문자열을 송신한다.
+// 입력   : str - 송신한 문자열을 저장할 버퍼의 주소
+//=============================================
+
+ void SerialPutString(char *str)
+ {
+
+    while(*str != '\0')         // 수신된 문자가 Null 문자( 0x00 )가 아니면 
+    {
+
+        SerialPutChar(*str++);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+ISR(TIMER0_OVF_vect)   // Timer0 overflow interrupt( 10 msec)  service routine
+{
+
+    static unsigned short  time_index = 0,  count1 = 0, TMP_Sum = 0; 
+    static unsigned short  TMP_sensor_ouput_buf[Avg_Num ]   ; 
+
+    unsigned char i = 0 ;
+
+
+    TCNT0 = 256 - 156;       //  내부클럭주기 = 1024/ (16x10^6) = 64 usec,  
+                             //  오버플로인터럽트 주기 = 10msec
+                             //  156 = 10msec/ 64usec
+
+    time_index++ ; 
+
+
+    if( time_index == 2 )    // 샘플링주기 =  20 msec = 10msec x 2 
+    {
+
+       time_index = 0; 
+
+
+      /**************   Temperature Sensor signal detection(AD 변환) ************/
+
+	   ADMUX &= ~0x1F;    //  ADC Chanel 1 : ADC 1 선택
+	   ADMUX |= 0x01;     //  ADC Chanel 1 : ADC 1 선택
+
+	   ADCSRA |= 0x40;    // ADC start 
+
+	   while( ( ADCSRA & 0x10 ) == 0x00  ) ;  // Check if ADC Conversion is completed 
+
+	   TMP_sensor_ouput = ADC;                // ADC Conversion 이 완료되었으면 ADC 결과 저장 
+ 
+     /******************************************************/ 
+
+   ////////////////////////////////////////////////////////////////////
+   //////////                                               /////////// 
+   //////////  Avg_Num(4개) 개씩 이동 평균(Moving Average)  ///////////
+   //////////                                               ///////////
+   ////////////////////////////////////////////////////////////////////
+
+	   if( count1 <= ( Avg_Num -1 ) )
+	   {
+             TMP_sensor_ouput_buf[ count1 ] = TMP_sensor_ouput ;
+			 TMP_Sum +=  TMP_sensor_ouput_buf[ count1 ] ; 
+	         count1++ ; 
+
+	   } 
+	   else
+	   {
+             TMP_Sum +=  TMP_sensor_ouput  ;	       // 가장 최근 값 더하고  
+             TMP_Sum -=  TMP_sensor_ouput_buf[ 0 ] ;   // 가장 오랜된 값 빼고 
+
+             TMP_sensor_ouput_avg = TMP_Sum / Avg_Num ;     // 4개 이동 평균 
+
+ 
+             // 섭씨온도 계산 : 증폭기 사용하지 않았을때  
+             TMP_sensor_ouput_avg_C =   ( unsigned short) ( (unsigned long) 1250 * TMP_sensor_ouput_avg  / 256  )  ;           // 온도 계산 [C] 단위
+
+
+             for( i = 0; i <= (Avg_Num - 2) ; i++ )
+			 {
+                 TMP_sensor_ouput_buf[ i ]  = TMP_sensor_ouput_buf[ i+1 ] ;
+			 } 
+
+             TMP_sensor_ouput_buf[ Avg_Num - 1 ]  = TMP_sensor_ouput ;  
+
+	   }
+
+       //////////////////////////////////////////////////////////////////
+
+
+
+   }
+
+
+}
+
+
+ 
+
+
+
+void DC_Motor_Run_Fwd( short duty )   // DC 모터 정회전 함수 
+{
+
+    if( duty > Vmax )     duty = Vmax ;
+
+    PORTA &= ~0x01;     //  모터구동신호 - 단자 : 0 V 인가( PA0 = 0 );  
+	OCR1A = duty;       //  모터구동신호 + 단자 : OC1A(PB5) PWM duty 설정 
+
+
+}
+
+void DC_Motor_Run_Rev( short duty )   // DC 모터 역회전 함수 
+{
+
+    if( duty > Vmax )     duty = Vmax ;
+
+    PORTA |= 0x01;            //  모터구동신호 - 단자 : 5 V 인가( PA0 = 1 );  
+	OCR1A = Vmax - duty;      //  모터구동신호 + 단자 : OC1A(PB5) PWM duty 설정 
+
+
+}
+
+
+void DC_Motor_Stop( void )   // DC 모터 정지 함수 
+{
+
+    PORTA &= ~0x01;     //  모터구동신호 - 단자 : 0 V 인가( PA0 = 0 );  
+	OCR1A = 0;          //  모터구동신호 + 단자 : OC1A(PB5) PWM duty = 0 설정 
+
+
+}
+
+
+
+void DC_Motor_PWM( short Vref )   // DC 모터 PWM 신호 발생 함수  
+{
+
+   if ( Vref > Vmax )       Vref = Vmax ;
+   else if( Vref < -Vmax )  Vref = -Vmax ;
+
+   if( Vref > 0 )  
+   {
+      DC_Motor_Run_Fwd( Vref ) ;
+   }
+   else if( Vref == 0 )  
+   {
+      DC_Motor_Stop() ;
+   }
+   else if( Vref < 0 )  
+   {
+      DC_Motor_Run_Rev( -Vref ) ;
+   }
+
+
+}
+
+
+
+void Display_TMP_LCD( unsigned int tp  )       // 온도를 10진수 형태로 LCD 에 디스플레이 
+{
+
+	HexToDec( tp, 10); //10진수로 변환 
+
+ 
+    LcdPutchar(NumToAsc(cnumber[2]) );   // 10자리 디스플레이
+	
+    LcdPutchar(NumToAsc(cnumber[1]));    // 1자리 디스플레이 
+
+    LcdPuts( ".");                       // 소숫점(.) 디스플레이 
+
+    LcdPutchar(NumToAsc(cnumber[0]));    // 0.1 자리 디스플레이 
+
+ 
+
+}
+
+
+
+
+void Display_Number_LCD( unsigned int num, unsigned char digit )       // 부호없는 정수형 변수를 10진수 형태로 LCD 에 디스플레이 
+{
+
+	HexToDec( num, 10); //10진수로 변환 
+
+	if( digit == 0 )     digit = 1 ;
+	if( digit > 5 )      digit = 5 ;
+ 
+    if( digit >= 5 )     LcdPutchar( NumToAsc(cnumber[4]) );  // 10000자리 디스플레이
+	
+	if( digit >= 4 )     LcdPutchar(NumToAsc(cnumber[3]));    // 1000자리 디스플레이 
+
+	if( digit >= 3 )     LcdPutchar(NumToAsc(cnumber[2]));    // 100자리 디스플레이 
+
+	if( digit >= 2 )     LcdPutchar(NumToAsc(cnumber[1]));    // 10자리 디스플레이
+
+	if( digit >= 1 )     LcdPutchar(NumToAsc(cnumber[0]));    //  1자리 디스플레이
+
+}
+
+void HexToDec( unsigned short num, unsigned short radix) 
+{
+	int j ;
+
+	for(j=0; j<5 ; j++) cnumber[j] = 0 ;
+
+	j=0;
+	do
+	{
+		cnumber[j++] = num % radix ; 
+		num /= radix; 
+
+	} while(num);
+
+} 
+
+char NumToAsc( unsigned char Num )
+{
+	if( Num <10 ) Num += 0x30; 
+	else          Num += 0x37; 
+
+	return Num ;
+}
+
+
+
+
+
+void msec_delay(unsigned int n)
+{	
+	for(; n>0; n--)		// 1msec 시간 지연을 n회 반복
+		_delay_ms(1);		// 1msec 시간 지연
+}
+
+void usec_delay(unsigned int n)
+{	
+	for(; n>0; n--)		// 1usec 시간 지연을 n회 반복
+		_delay_us(1);		// 1usec 시간 지연
+}
+
+
